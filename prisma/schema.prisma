@@ -1,0 +1,223 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Org {
+  id                     String       @id @default(uuid())
+  name                   String
+  // Unencrypted lookup key for POST /webhooks/fathom/:fathomWebhookKey
+  fathomWebhookKey       String       @unique @default(cuid())
+  fathomSecretEnc        String?      // AES-256-GCM encrypted webhook secret
+  fathomApiKeyEnc        String?      // AES-256-GCM encrypted Fathom API key
+  
+  // HubSpot OAuth state with refresh lock support
+  hubspotPortalId        String?      @unique
+  hubspotAccessTokenEnc  String?
+  hubspotRefreshTokenEnc String?
+  hubspotTokenExpiresAt  DateTime?
+
+  // Matching & Validation settings
+  internalDomains        String[]     @default([]) // e.g. ["acme.com"]
+  autoWrite              Boolean      @default(false)
+  confidenceMin          Float        @default(0.8)
+  transcriptRetentionDays Int         @default(30)
+  
+  // Typed via JSON Schema in code: stages, allowedTransitions, and requiredProperties per stage
+  pipelineConfig         Json         @default("{}")
+
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+  users                  User[]
+  calls                  Call[]
+  reviewItems            ReviewItem[]
+  crmWrites              CrmWrite[]
+}
+
+model User {
+  id             String   @id @default(uuid())
+  orgId          String
+  email          String
+  role           UserRole @default(REP)
+  hubspotOwnerId String?  // Mapped from HubSpot Owners API for task/note attribution
+  slackUserId    String?  // For interactive Slack Block Kit notifications
+  createdAt      DateTime @default(now())
+
+  org            Org      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  calls          Call[]
+
+  @@unique([orgId, email])
+  @@index([orgId, hubspotOwnerId])
+}
+
+enum UserRole {
+  REP
+  ADMIN
+}
+
+model Call {
+  id                   String       @id @default(uuid())
+  orgId                String
+  hostUserId           String?
+  fathomCallId         String       @unique
+  
+  // SHA-256(orgId + 5min_startedAt_bucket + sorted_external_emails)
+  // Prevents duplicate runs when 2+ reps record the same call
+  meetingFingerprint   String
+  
+  title                String?
+  startedAt            DateTime
+  durationSeconds      Int?
+  
+  // [{ name, email, isExternal, speakerLabel }]
+  attendees            Json
+  
+  // [{ turnId: 0, speakerName, speakerEmail, isExternal, timestampMs, text }]
+  // Nullable so the retention cron can scrub PII after 30 days while keeping extraction/audit
+  transcriptTurns      Json?
+  transcriptScrubbedAt DateTime?
+
+  status               CallStatus   @default(RECEIVED)
+  
+  // HubSpot association targets
+  dealId               String?
+  matchedContactIds    String[]     @default([])
+  matchedCompanyId     String?
+  matchMethod          MatchMethod?
+
+  // Stores the final ResolvedExtractionPayload after code-side date resolution
+  extraction           Json?
+  failureReason        String?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  org                  Org          @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  hostUser             User?        @relation(fields: [hostUserId], references: [id], onDelete: SetNull)
+  reviewItems          ReviewItem[]
+  writes               CrmWrite[]
+
+  @@unique([orgId, meetingFingerprint])
+  @@index([orgId, status])
+  @@index([orgId, dealId])
+  @@index([transcriptScrubbedAt, createdAt])
+}
+
+enum CallStatus {
+  RECEIVED
+  MATCHED
+  EXTRACTED
+  WRITTEN
+  NEEDS_REVIEW
+  FAILED
+  SKIPPED
+}
+
+enum MatchMethod {
+  ATTENDEE_EMAIL
+  COMPANY_DOMAIN
+  CALENDAR_TITLE
+  MANUAL
+}
+
+model ReviewItem {
+  id                String       @id @default(uuid())
+  orgId             String
+  callId            String
+  reason            ReviewReason
+  
+  // Snapshot of the deal's HubSpot stage when the review item was created.
+  // Prevents stale approvals from regressing a deal a rep manually updated later.
+  expectedDealStage String?
+  
+  // Populated when reason == AMBIGUOUS_MATCH: [{ dealId, dealName, stage, lastActivityAt }]
+  candidateDeals    Json?
+  
+  // ResolvedExtractionPayload that the system wants to write
+  proposal          Json
+  
+  status            ReviewStatus @default(OPEN)
+  resolvedById      String?
+  resolvedAt        DateTime?
+  createdAt         DateTime     @default(now())
+
+  org               Org          @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  call              Call         @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, status, createdAt])
+  @@index([callId])
+}
+
+enum ReviewReason {
+  NO_MATCH
+  AMBIGUOUS_MATCH
+  LOW_CONFIDENCE
+  INVALID_OUTPUT
+  STAGE_REGRESSION
+  CLOSED_STAGE_GATE
+  MISSING_STAGE_PROPERTIES
+}
+
+enum ReviewStatus {
+  OPEN
+  APPROVED
+  EDITED
+  REJECTED
+  STALE
+}
+
+model CrmWrite {
+  id              String         @id @default(uuid())
+  orgId           String
+  callId          String
+  dealId          String
+  type            CrmWriteType
+  
+  // Write-ahead state machine: insert PENDING before calling HubSpot API
+  status          CrmWriteStatus @default(PENDING)
+  hubspotObjectId String?        // Note ID or Task ID returned by HubSpot
+  
+  before          Json?          // e.g. { dealstage: "qualifiedtobuy", hs_next_step: "..." }
+  after           Json           // Payload written to HubSpot
+  error           String?
+  
+  undoneAt        DateTime?
+  undoneById      String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  org             Org            @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  call            Call           @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  // Hard constraint preventing duplicate writes on worker crash/retry
+  @@unique([callId, type])
+  @@index([orgId, dealId])
+}
+
+enum CrmWriteType {
+  NOTE
+  STAGE
+  TASK
+  PROPERTY
+}
+
+enum CrmWriteStatus {
+  PENDING
+  WRITTEN
+  FAILED
+  UNDONE
+}
+
+model WebhookEvent {
+  id          String    @id @default(uuid())
+  orgId       String
+  source      String    // "fathom"
+  externalId  String    @unique
+  type        String
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([orgId, createdAt])
+}
