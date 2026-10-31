@@ -16,6 +16,36 @@ export interface HubSpotDealRecord {
   lastActivityAt: string; // Resolved from notes_last_updated or hs_lastmodifieddate
 }
 
+//HubSpot v4 default association type IDs
+const HS_ASSOC = {
+  NOTE_TO_DEAL: 214,
+  NOTE_TO_CONTACT: 202,
+  NOTE_TO_COMPANY: 190,
+  TASK_TO_DEAL: 216,
+  TASK_TO_CONTACT: 204,
+  TASK_TO_COMPANY: 192,
+} as const;
+
+export interface AssociationTargets {
+  dealId: string;
+  contactIds?: string[];
+  companyId?: string | null;
+}
+
+export interface CreateNoteInput {
+  bodyHtml: string;
+  ownerId?: string | null;
+  timestampIso: string;
+  targets: AssociationTargets;
+}
+
+export interface CreateTaskInput {
+  subject: string;
+  bodyText: string;
+  dueDateIso: string;
+  ownerId?: string | null;
+  targets: AssociationTargets;
+}
 export interface HubSpotOpenTask {
   id: string;
   subject: string;
@@ -458,5 +488,167 @@ export class HubSpotService {
         d.properties.hs_lastmodifieddate ||
         new Date(0).toISOString(),
     }));
+  }
+  async getDealProperties(
+    orgId: string,
+    dealId: string,
+    properties: string[],
+  ): Promise<Record<string, string | null>> {
+    const uniqueProps = Array.from(
+      new Set([
+        'dealname',
+        'dealstage',
+        'pipeline',
+        'hs_next_step',
+        ...properties,
+      ]),
+    );
+
+    const data = await this.request<{
+      id: string;
+      properties: Record<string, string | null>;
+    }>(orgId, {
+      method: 'GET',
+      url: `/crm/v3/objects/deals/${dealId}`,
+      params: { properties: uniqueProps.join(',') },
+    });
+
+    return data.properties;
+  }
+
+  async updateDealProperties(
+    orgId: string,
+    dealId: string,
+    properties: Record<string, string | number | boolean | null>,
+  ): Promise<void> {
+    const serialized: Record<string, string> = {};
+    for (const [k, v] of Object.entries(properties)) {
+      if (v !== undefined) {
+        serialized[k] = v === null ? '' : String(v);
+      }
+    }
+
+    await this.request(orgId, {
+      method: 'PATCH',
+      url: `/crm/v3/objects/deals/${dealId}`,
+      data: { properties: serialized },
+    });
+  }
+
+  async createNote(
+    orgId: string,
+    input: CreateNoteInput,
+  ): Promise<{ id: string }> {
+    const associations = this.buildInlineAssociations(input.targets, {
+      dealTypeId: HS_ASSOC.NOTE_TO_DEAL,
+      contactTypeId: HS_ASSOC.NOTE_TO_CONTACT,
+      companyTypeId: HS_ASSOC.NOTE_TO_COMPANY,
+    });
+
+    const properties: Record<string, string> = {
+      hs_timestamp: input.timestampIso,
+      hs_note_body: input.bodyHtml,
+    };
+    if (input.ownerId) {
+      properties.hubspot_owner_id = input.ownerId;
+    }
+
+    return this.request<{ id: string }>(orgId, {
+      method: 'POST',
+      url: '/crm/v3/objects/notes',
+      data: { properties, associations },
+    });
+  }
+
+  async createTask(
+    orgId: string,
+    input: CreateTaskInput,
+  ): Promise<{ id: string }> {
+    const associations = this.buildInlineAssociations(input.targets, {
+      dealTypeId: HS_ASSOC.TASK_TO_DEAL,
+      contactTypeId: HS_ASSOC.TASK_TO_CONTACT,
+      companyTypeId: HS_ASSOC.TASK_TO_COMPANY,
+    });
+
+    const properties: Record<string, string> = {
+      hs_timestamp: input.dueDateIso,
+      hs_task_subject: input.subject,
+      hs_task_body: input.bodyText,
+      hs_task_status: 'NOT_STARTED',
+      hs_task_priority: 'MEDIUM',
+      hs_task_type: 'TODO',
+    };
+    if (input.ownerId) {
+      properties.hubspot_owner_id = input.ownerId;
+    }
+
+    return this.request<{ id: string }>(orgId, {
+      method: 'POST',
+      url: '/crm/v3/objects/tasks',
+      data: { properties, associations },
+    });
+  }
+
+  async archiveObject(
+    orgId: string,
+    objectType: 'notes' | 'tasks',
+    objectId: string,
+  ): Promise<void> {
+    await this.request(orgId, {
+      method: 'DELETE',
+      url: `/crm/v3/objects/${objectType}/${objectId}`,
+    });
+  }
+
+  private buildInlineAssociations(
+    targets: AssociationTargets,
+    typeIds: {
+      dealTypeId: number;
+      contactTypeId: number;
+      companyTypeId: number;
+    },
+  ) {
+    const associations: Array<{
+      to: { id: string };
+      types: Array<{
+        associationCategory: 'HUBSPOT_DEFINED';
+        associationTypeId: number;
+      }>;
+    }> = [
+      {
+        to: { id: targets.dealId },
+        types: [
+          {
+            associationCategory: 'HUBSPOT_DEFINED',
+            associationTypeId: typeIds.dealTypeId,
+          },
+        ],
+      },
+    ];
+
+    for (const contactId of targets.contactIds ?? []) {
+      associations.push({
+        to: { id: contactId },
+        types: [
+          {
+            associationCategory: 'HUBSPOT_DEFINED',
+            associationTypeId: typeIds.contactTypeId,
+          },
+        ],
+      });
+    }
+
+    if (targets.companyId) {
+      associations.push({
+        to: { id: targets.companyId },
+        types: [
+          {
+            associationCategory: 'HUBSPOT_DEFINED',
+            associationTypeId: typeIds.companyTypeId,
+          },
+        ],
+      });
+    }
+    return associations;
   }
 }
