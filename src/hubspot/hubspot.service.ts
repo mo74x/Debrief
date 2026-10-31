@@ -1,5 +1,4 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
-// src/hubspot/hubspot.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosError, AxiosRequestConfig } from 'axios';
 import { Prisma } from '@prisma/client';
@@ -15,6 +14,12 @@ export interface HubSpotDealRecord {
   closedate: string | null;
   hs_is_closed: boolean;
   lastActivityAt: string; // Resolved from notes_last_updated or hs_lastmodifieddate
+}
+
+export interface HubSpotOpenTask {
+  id: string;
+  subject: string;
+  status: string;
 }
 
 export interface PipelineStageConfig {
@@ -108,6 +113,53 @@ export class HubSpotService {
     }
 
     throw new Error('Exhausted HubSpot API retries');
+  }
+
+  async getOpenTasksForDeal(
+    orgId: string,
+    dealId: string,
+  ): Promise<HubSpotOpenTask[]> {
+    // 1. Read associated task IDs via v4 Associations API
+    const assocData = await this.request<{
+      results: Array<{ to: Array<{ toObjectId: number }> }>;
+    }>(orgId, {
+      method: 'POST',
+      url: '/crm/v4/associations/deals/tasks/batch/read',
+      data: { inputs: [{ id: dealId }] },
+    });
+
+    const taskIds = Array.from(
+      new Set(
+        (assocData.results || []).flatMap((r) =>
+          (r.to || []).map((t) => String(t.toObjectId)),
+        ),
+      ),
+    );
+
+    if (taskIds.length === 0) return [];
+
+    // 2. Batch read task properties and filter out COMPLETED tasks
+    const tasksData = await this.request<{
+      results: Array<{
+        id: string;
+        properties: { hs_task_subject?: string; hs_task_status?: string };
+      }>;
+    }>(orgId, {
+      method: 'POST',
+      url: '/crm/v3/objects/tasks/batch/read',
+      data: {
+        inputs: taskIds.map((id) => ({ id })),
+        properties: ['hs_task_subject', 'hs_task_status'],
+      },
+    });
+
+    return (tasksData.results || [])
+      .filter((t) => t.properties.hs_task_status !== 'COMPLETED')
+      .map((t) => ({
+        id: t.id,
+        subject: t.properties.hs_task_subject || '',
+        status: t.properties.hs_task_status || 'NOT_STARTED',
+      }));
   }
 
   /**
