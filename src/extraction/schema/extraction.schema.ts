@@ -73,6 +73,16 @@ export const ResolvedNextStepSchema = RawNextStepSchema.extend({
 
 export type ResolvedNextStep = z.infer<typeof ResolvedNextStepSchema>;
 
-export interface ResolvedExtraction extends Omit<RawExtraction, 'next_step'> {
-  next_step: ResolvedNextStep | null;
-}
+export const ResolvedExtractionSchema = z.object({
+  summary: z.string().min(10),
+  key_points: z.array(z.string().min(1)).min(1).max(8),
+  stage_proposal: StageProposalSchema,
+  next_step: ResolvedNextStepSchema.nullable().default(null),
+  extracted_stage_properties: z
+    .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+    .default({}),
+  risks: z.array(z.string()).default([]),
+  no_update_reason: z.string().nullable().default(null),
+});
+
+export type ResolvedExtraction = z.infer<typeof ResolvedExtractionSchema>;
